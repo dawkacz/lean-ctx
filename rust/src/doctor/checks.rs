@@ -974,6 +974,11 @@ pub(super) fn proxy_upstream_outcome() -> Outcome {
             cfg.proxy.resolve_upstream(ProxyProvider::OpenAi),
         ),
         (
+            "ChatGPT",
+            "proxy.chatgpt_upstream",
+            cfg.proxy.resolve_upstream(ProxyProvider::ChatGpt),
+        ),
+        (
             "Gemini",
             "proxy.gemini_upstream",
             cfg.proxy.resolve_upstream(ProxyProvider::Gemini),
@@ -1005,6 +1010,9 @@ pub(super) fn proxy_upstream_outcome() -> Outcome {
         ) || matches!(
             *label,
             "OpenAI" if resolved == "https://api.openai.com"
+        ) || matches!(
+            *label,
+            "ChatGPT" if resolved == "https://chatgpt.com"
         ) || matches!(
             *label,
             "Gemini" if resolved == "https://generativelanguage.googleapis.com"
@@ -1057,7 +1065,7 @@ pub(super) fn proxy_upstream_drift_outcome() -> Option<Outcome> {
         return None;
     }
     let port = crate::proxy_setup::default_port();
-    let (live_anthropic, live_openai, live_gemini) = proxy_live_upstreams(port)?;
+    let (live_anthropic, live_openai, live_chatgpt, live_gemini) = proxy_live_upstreams(port)?;
     let disk = cfg.proxy.resolve_all_disk();
 
     let mut env_not_applied = Vec::new();
@@ -1076,6 +1084,13 @@ pub(super) fn proxy_upstream_drift_outcome() -> Option<Outcome> {
             ProxyProvider::OpenAi,
             &disk.openai,
             &live_openai,
+        ),
+        (
+            "ChatGPT",
+            "chatgpt",
+            ProxyProvider::ChatGpt,
+            &disk.chatgpt,
+            &live_chatgpt,
         ),
         (
             "Gemini",
@@ -1871,6 +1886,67 @@ pub(super) fn lsp_server_outcomes() -> Vec<Outcome> {
         .collect()
 }
 
+/// True when `cwd_str` points inside an IDE/agent config directory rather than a
+/// real project (LM Studio, Claude, CodeBuddy, Codex). Matches both POSIX (`/`)
+/// and Windows (`\`) separators so the warning fires on every platform.
+fn cwd_looks_like_agent_dir(cwd_str: &str) -> bool {
+    const AGENT_DIRS: [&str; 4] = [".lmstudio", ".claude", ".codebuddy", ".codex"];
+    AGENT_DIRS
+        .iter()
+        .any(|dir| cwd_str.contains(&format!("/{dir}")) || cwd_str.contains(&format!("\\{dir}")))
+}
+
+/// Warn if lean-ctx is running as an MCP server from a directory that lacks
+/// a project marker and looks like an IDE/agent tool directory (e.g. .lmstudio,
+/// .claude). This usually means the MCP client launched the process from the
+/// wrong CWD, causing "path escapes project root" errors for every tool call.
+pub(super) fn mcp_server_cwd_outcome() -> Outcome {
+    let is_mcp = std::env::var("LEAN_CTX_MCP_SERVER").is_ok_and(|v| v == "1");
+    if !is_mcp {
+        return Outcome {
+            ok: true,
+            line: format!("{BOLD}MCP server CWD{RST}  {DIM}(not running as MCP server){RST}"),
+        };
+    }
+
+    let Ok(cwd) = std::env::current_dir() else {
+        return Outcome {
+            ok: true,
+            line: format!("{BOLD}MCP server CWD{RST}  {YELLOW}could not resolve{RST}"),
+        };
+    };
+
+    let has_marker = crate::core::pathutil::has_project_marker(&cwd);
+    let cwd_str = cwd.to_string_lossy();
+    let suspicious = cwd_looks_like_agent_dir(&cwd_str);
+
+    if has_marker {
+        Outcome {
+            ok: true,
+            line: format!(
+                "{BOLD}MCP server CWD{RST}  {GREEN}under project root{RST}  {DIM}{}{RST}",
+                cwd.display()
+            ),
+        }
+    } else if suspicious {
+        Outcome {
+            ok: false,
+            line: format!(
+                "{BOLD}MCP server CWD{RST}  {RED}suspicious directory without project marker{RST}  {DIM}lean-ctx was launched from {}, which is an IDE/agent config dir without a project root — \"path escapes project root\" errors will occur. Set `cwd` in your MCP client config to a real project directory, or add `allow_auto_reroot = true` + `extra_roots` in config.toml{RST}",
+                cwd.display()
+            ),
+        }
+    } else {
+        Outcome {
+            ok: false,
+            line: format!(
+                "{BOLD}MCP server CWD{RST}  {YELLOW}no project marker found in CWD{RST}  {DIM}cwd={} — \"path escapes project root\" errors may occur for files outside this directory. Add `cwd` to your MCP client config or add `extra_roots` / `allow_paths` in config.toml{RST}",
+                cwd.display()
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1885,6 +1961,33 @@ mod tests {
 
     fn check(home: &Path, scope: RulesScope, injection: RulesInjection) -> Outcome {
         claude_instructions_check(home, scope, injection)
+    }
+
+    #[test]
+    fn cwd_looks_like_agent_dir_matches_both_separators() {
+        for sep in ['/', '\\'] {
+            for dir in [".lmstudio", ".claude", ".codebuddy", ".codex"] {
+                let cwd = format!("C:{sep}Users{sep}me{sep}{dir}{sep}mcp");
+                assert!(
+                    cwd_looks_like_agent_dir(&cwd),
+                    "expected {cwd} to be flagged as an agent dir"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cwd_looks_like_agent_dir_ignores_real_projects() {
+        for cwd in [
+            "/home/me/work/myproj",
+            "/Users/me/code/lean-ctx",
+            "C:\\src\\app",
+        ] {
+            assert!(
+                !cwd_looks_like_agent_dir(cwd),
+                "{cwd} is a real project and must not be flagged"
+            );
+        }
     }
 
     // GH #396: the exact post-`setup` state — CLAUDE.md block + skill, rules

@@ -6,6 +6,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **Codex ChatGPT subscription auth now routes through the proxy (#568).**
+  Completes the #554 fix: instead of skipping config when a Codex ChatGPT login
+  is detected (which left subscription users at 0 savings), `install_codex_env`
+  now writes a mode-specific config. ChatGPT subscription auth is pointed at the
+  proxy's Codex backend rail (`model_provider = leanctx-chatgpt`, `openai_base_url
+  = …/backend-api/codex`, `chatgpt_base_url = …/backend-api` for aux calls such as
+  the codex_apps streamable-HTTP MCP endpoint); API-key Codex keeps the `/v1`
+  path. The proxy gained `/backend-api/codex/responses` (compressed/metered via the
+  OpenAI Responses path to `chatgpt.com`) plus credential-preserving passthrough
+  for non-model `/backend-api/*` traffic. Header forwarding stays allowlist-based
+  both ways; a dedicated cookie store persists **only** Cloudflare anti-bot cookies
+  (`cf_clearance`/`__cf_bm`/`cf_chl_*`) and drops auth/session cookies; gzip/zstd
+  request bodies are decoded under a bounded reader (zip-bomb safe) before
+  compression and re-encoded. Thanks @ousatov-ua.
+- **`lean-ctx doctor` warns when the MCP server is launched from a directory
+  without a project root (#547).** When an MCP client spawns lean-ctx from an
+  IDE/agent config dir (`.lmstudio`, `.claude`, `.codex`, `.codebuddy`) or any
+  marker-less CWD, every out-of-tree `ctx_read` fails with "path escapes project
+  root". The new `MCP server CWD` doctor check (also surfaced in the structured
+  health report) explains the cause and the fix (`cwd` in the client config, or
+  `allow_auto_reroot`/`extra_roots`); `.lmstudio` is now also treated as a
+  suspicious persisted root. Thanks @albinekb.
+- **Shadow-mode CLI reads/searches now record Context IR lineage (#566).**
+  Follow-up to #550. The MCP dispatcher records a Context IR provenance entry for
+  every tool call (`server/call_tool.rs`), but the shadow-mode hook's single-shot
+  `lean-ctx read`/`grep` subprocess dropped it — so `ctx_proof` and IR exports
+  were blind to compressed shadow reads. `record_file_read`/`record_search` now
+  thread the rendered-output excerpt + measured tool duration into a disk-backed
+  `ContextIrV1` load→record→save, mirroring the MCP path (same 200-char
+  char-boundary excerpt bound; `mode`/`pattern` ride the IR `pattern` slot; the
+  read's `original_tokens` and the search's raw matched-line estimate are the IR
+  input so the stored compression ratio is accurate — no fabricated values). The
+  remaining two deferred items from #550 — the in-memory loop/correction
+  detectors and the bounce/adaptive-threshold signals — stay deferred: both need
+  cross-call state a single-shot process cannot hold, so they are gated on the
+  "connect-only daemon routing for hooks" design decision (tracked in #566).
 - **PowerShell-native cmdlets route through lean-ctx (#561).** Follow-up to #556:
   shadow/harden mode already recognised the Windows `powershell` shell tool, covering
   the Unix-style PS *aliases* (`cat`/`ls`/`rg`). The command-rewrite layer now also
@@ -68,6 +104,79 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   (gitlab #868–#871)
 
 ### Fixed
+- **`ctx_read` left an empty ` []` metadata field on incompressible files (#509).**
+  The `entropy` (and `density`) read modes append a ` [techniques…]` tag listing
+  which compression techniques fired. On a file where none did (high-entropy, no
+  duplicate blocks) the technique list is empty, so the header rendered a bare
+  ` H̄=4.2 []` — the same empty-trailing-field waste fixed for
+  `ctx_semantic_search`'s `(rrf: X, )` in #511. A `techniques_tag` helper now omits
+  the bracket segment entirely when the list is empty (and keeps the leading space
+  + `[a, b]` form otherwise), so the header is clean on both paths. (#509-A output
+  audit; output stays a deterministic function of content/mode per #498.)
+- **Pi `AGENTS.md` advertised renamed tools that no longer exist (#548).** The Pi
+  installer writes a curated static `templates/PI_AGENTS.md`, and its tool-mapping
+  table still listed `ctx_grep`/`ctx_find`/`ctx_ls` — tools renamed long ago to
+  `ctx_search`/`ctx_glob`/`ctx_tree`. Pi agents that followed the table issued
+  unknown-tool calls. The template (and the matching `pi.rs` setup hint) now use the
+  canonical names, and a new parity test (`tests/rules_template_tool_names.rs`) ties
+  **every** shipped agent template to the live MCP registry: any `ctx_*` reference
+  that is not a registered tool fails the build, so a future rename can never drift
+  silently again. (First slice of the #548 agent-rules unification — marker/dedup
+  consolidation, content-aware freshness, and `rules.toml`↔`sync` semantics follow.)
+- **Rule injection skipped content/compression changes when the version was unchanged (#548).**
+  The injector's freshness check was version-only: it compared the on-disk
+  `<!-- version: N -->` against `RULES_VERSION` and skipped the rewrite when they
+  matched. So a change that alters the rendered body *without* bumping the version —
+  toggling `shadow_mode`, switching `compression_level`, or editing a canonical
+  section between releases — left every agent's rules block stale until the next
+  version bump. `RulesFile::block_matches_render` now compares the on-disk block
+  byte-for-byte (whitespace-insensitive) against a fresh render for the active
+  parameters, and the skip path requires *both* `is_current()` **and** that content
+  match. Re-running `sync`/inject after a compression-level change now regenerates
+  the block as expected; an unchanged config stays idempotent. (Second slice of the
+  #548 agent-rules unification, after the Pi-template parity guard.)
+- **`rules diff`/`sync` ↔ `.lean-ctx/rules.toml` semantics, and a `rules diff`
+  false-positive (#548).** Two coupled fixes for the rules-governance commands:
+  - **`sync`/`diff` do not consume `rules.toml` — now documented and decoupled.**
+    `rules sync`/`diff` regenerate from the canonical `rules_canonical` source of
+    truth (preserving user text around the markers) and never read `rules.toml`,
+    which is the input for `rules lint` plus a user-editable inventory from `rules
+    init`. This is now stated in the `rules` help, the `init` next-steps, and the
+    `RulesConfig`/`sync` docs. `detect_drift` no longer loads `RulesConfig` at all,
+    so `rules diff` works **without** first running `rules init` (it previously
+    failed with "No rules config found") — the dead `_config` parameter is gone and
+    the command is infallible.
+  - **`rules diff` reported phantom drift after every sync.** Drift picked the
+    shared-vs-dedicated expected block from a content heuristic ("up_to_date and no
+    'existing user rules'"), which misread freshly synced *shared* files with no
+    user text (Copilot CLI, Codex CLI, Gemini/OpenCode in shared mode) as the
+    dedicated layout and flagged them as `DRIFTED` on every run. Drift now compares
+    each target against the canonical block for its **real** `RulesFormat` via the
+    new `rules_inject::expected_blocks_by_target`, keeping `sync` and `diff` in
+    agreement. Covered by new tests: `detect_drift_without_rules_toml_does_not_
+    require_init` and `sync_then_diff_reports_no_drift`. (Third slice of the #548
+    agent-rules unification.)
+- **Compression block had two disagreeing marker models, so cross-channel dedup
+  never fired (#548).** `rules_canonical::render` embedded the output-style
+  compression prompt *inline* inside the `<!-- lean-ctx-rules -->` block with no
+  delimiters, but the coverage/dedup readers (`rules_channel`, `rules dedup`)
+  detect the payload by a separate `<!-- lean-ctx-compression -->` … `<!--
+  /lean-ctx-compression -->` block. Since the writer never emitted those markers,
+  `cursor_compression_covered`/`client_autoloads_compression` were always false on
+  freshly written rule files — so the MCP per-session instructions kept repeating
+  the compression block even for Cursor/Codex that already load it from their rule
+  file (double billing), and `rules dedup` could not thin a render-produced shared
+  `AGENTS.md`. The two models are now one: the `COMPRESSION_BLOCK_*` markers live in
+  `rules_canonical` (single marker source, re-exported from `rules_channel`), and
+  `render` wraps the compression prompt in them for the persistent carriers
+  (`Dedicated`/`Shared` — every injected rule file). The ephemeral `Bare` MCP
+  channel stays unmarked by design (its inclusion is *governed* by carrier coverage,
+  so a per-session marker would be noise). Content-aware freshness (second slice)
+  re-propagates the new block on the next `sync` without a version bump. Covered by
+  new tests asserting carriers wrap / `Bare` does not / `Off` emits nothing, and an
+  end-to-end check that a `render`-produced Cursor block is now recognised as
+  compression coverage. (Fourth slice of the #548 agent-rules unification — closes
+  the "one canonical carrier/marker model" acceptance criterion.)
 - **Shadow-mode hook reads dropped ~75% of the MCP read side effects (#550).** When
   shadow/harden mode intercepts a native `view`/`grep` call it spawns `lean-ctx read`
   as a single-shot subprocess. That CLI path recorded only a fraction of what the MCP

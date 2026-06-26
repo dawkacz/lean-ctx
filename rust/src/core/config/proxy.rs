@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProxyConfig {
     pub anthropic_upstream: Option<String>,
     pub openai_upstream: Option<String>,
+    pub chatgpt_upstream: Option<String>,
     pub gemini_upstream: Option<String>,
     /// History-pruning strategy for proxied chat requests.
     /// "cache-aware" (default) | "rolling" | "off". See [`HistoryMode`].
@@ -71,6 +72,33 @@ pub struct ProxyConfig {
     /// would invalidate the prompt cache. Env `LEAN_CTX_PROXY_EFFORT`. See
     /// [`ProxyConfig::resolved_effort`].
     pub effort: Option<String>,
+    /// How the proxy squeezes prose it must shrink (#895): `"auto"` (default) and
+    /// `"extractive"` use embedding-based extractive ranking — keeping the most
+    /// central sentences instead of just the prefix — when the local embedding
+    /// engine is available, falling back to truncation otherwise; `"truncate"`
+    /// keeps the original deterministic FIFO squeeze (and no engine). Wire
+    /// rewrites are memoized per content so the engine's cold→warm transition
+    /// never changes an already-emitted frozen-region rewrite (#448/#498). Env
+    /// `LEAN_CTX_PROXY_PROSE_RANKER`. See [`ProxyConfig::resolved_prose_ranker`].
+    pub prose_ranker: Option<String>,
+    /// Fraction `0.0..=1.0` of conversations placed in the output-savings control
+    /// arm (#895 Track B). `0` (default) = no holdout (every conversation is
+    /// shaped). When `> 0`, a deterministic cohort = `blake3(system + first user
+    /// msg)` puts ~this fraction of conversations in a control arm that skips
+    /// output-shaping (effort control + verbosity steer) but is still metered —
+    /// giving an honest measured output-token reduction. The cohort is a pure
+    /// function of conversation identity, so a conversation stays in one arm
+    /// across turns (cache-safe). Env `LEAN_CTX_PROXY_OUTPUT_HOLDOUT`. See
+    /// [`ProxyConfig::output_holdout_fraction`].
+    pub output_holdout: Option<f64>,
+    /// Opt-in cache-safe wire verbosity steer (#895). When `true`, the proxy
+    /// appends a single constant "be concise" instruction to the last user turn
+    /// of each request (output-shaping for non-rules-aware API clients). The
+    /// suffix is constant and appended strictly after the last `cache_control`
+    /// breakpoint, so the provider prompt-cache prefix stays byte-stable. Default
+    /// `false`. Env `LEAN_CTX_PROXY_VERBOSITY_STEER`. See
+    /// [`ProxyConfig::verbosity_steer_enabled`].
+    pub verbosity_steer: Option<bool>,
 }
 
 /// Per-role prose-compression intensity for the proxy's frozen request region.
@@ -98,6 +126,20 @@ pub struct RoleAggressiveness {
 pub enum ProseRole {
     System,
     User,
+}
+
+/// How the proxy squeezes prose it must shrink (#895).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProseRanker {
+    /// Extractive embedding ranking when the engine is available, else truncate.
+    /// The default — strictly better than truncation, and cache-safe via the
+    /// per-content memo in [`crate::proxy::prose_ranker`].
+    Auto,
+    /// Same engine path as `Auto` (kept distinct so an operator can express
+    /// intent / so a future "require engine" semantic has a name).
+    Extractive,
+    /// Original deterministic FIFO squeeze; never touches the embedding engine.
+    Truncate,
 }
 
 /// How the proxy prunes old tool results from conversation history.
@@ -146,6 +188,55 @@ impl ProxyConfig {
     /// in config.toml, default `true`.
     pub fn meters_openai_usage(&self) -> bool {
         self.meter_openai_usage.unwrap_or(true)
+    }
+
+    /// Resolved prose-ranker strategy (#895). Precedence: the
+    /// `LEAN_CTX_PROXY_PROSE_RANKER` env var, then `[proxy] prose_ranker` in
+    /// config.toml, then `Auto`. Unknown values resolve to `Auto` so a typo can
+    /// never silently disable the premium path; `"truncate"`/`"off"` selects the
+    /// legacy squeeze.
+    #[must_use]
+    pub fn resolved_prose_ranker(&self) -> ProseRanker {
+        let raw = std::env::var("LEAN_CTX_PROXY_PROSE_RANKER")
+            .ok()
+            .or_else(|| self.prose_ranker.clone());
+        match raw.as_deref().map(str::trim) {
+            Some(s) if s.eq_ignore_ascii_case("truncate") || s.eq_ignore_ascii_case("off") => {
+                ProseRanker::Truncate
+            }
+            Some(s) if s.eq_ignore_ascii_case("extractive") => ProseRanker::Extractive,
+            _ => ProseRanker::Auto,
+        }
+    }
+
+    /// Resolved output-savings holdout fraction (#895 Track B), clamped to
+    /// `[0,1]`. Precedence: `LEAN_CTX_PROXY_OUTPUT_HOLDOUT` env > `[proxy]
+    /// output_holdout` > `0.0` (no holdout). An unparseable/blank env value is
+    /// ignored so a typo can never silently change the experiment fraction.
+    #[must_use]
+    pub fn output_holdout_fraction(&self) -> f64 {
+        let from_env = std::env::var("LEAN_CTX_PROXY_OUTPUT_HOLDOUT")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok());
+        from_env
+            .or(self.output_holdout)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
+    }
+
+    /// Whether the cache-safe wire verbosity steer (#895) is enabled. Precedence:
+    /// `LEAN_CTX_PROXY_VERBOSITY_STEER` env (`1`/`true`/`on`) > `[proxy]
+    /// verbosity_steer` > `false` (off).
+    #[must_use]
+    pub fn verbosity_steer_enabled(&self) -> bool {
+        if let Ok(raw) = std::env::var("LEAN_CTX_PROXY_VERBOSITY_STEER") {
+            let v = raw.trim();
+            return v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("yes");
+        }
+        self.verbosity_steer.unwrap_or(false)
     }
 
     /// Whether the opt-in cold-prefix repack (#480) is enabled. A wrong "cold"
@@ -273,6 +364,11 @@ impl ProxyConfig {
                 self.openai_upstream.as_deref(),
                 "https://api.openai.com",
             ),
+            ProxyProvider::ChatGpt => (
+                "LEAN_CTX_CHATGPT_UPSTREAM",
+                self.chatgpt_upstream.as_deref(),
+                "https://chatgpt.com",
+            ),
             ProxyProvider::Gemini => (
                 "LEAN_CTX_GEMINI_UPSTREAM",
                 self.gemini_upstream.as_deref(),
@@ -332,6 +428,7 @@ impl ProxyConfig {
         Upstreams {
             anthropic: self.resolve_upstream(ProxyProvider::Anthropic),
             openai: self.resolve_upstream(ProxyProvider::OpenAi),
+            chatgpt: self.resolve_upstream(ProxyProvider::ChatGpt),
             gemini: self.resolve_upstream(ProxyProvider::Gemini),
         }
     }
@@ -347,6 +444,7 @@ impl ProxyConfig {
         Upstreams {
             anthropic: pick(ProxyProvider::Anthropic),
             openai: pick(ProxyProvider::OpenAi),
+            chatgpt: pick(ProxyProvider::ChatGpt),
             gemini: pick(ProxyProvider::Gemini),
         }
     }
@@ -365,6 +463,7 @@ impl ProxyConfig {
         Upstreams {
             anthropic: keep(ProxyProvider::Anthropic, &last.anthropic),
             openai: keep(ProxyProvider::OpenAi, &last.openai),
+            chatgpt: keep(ProxyProvider::ChatGpt, &last.chatgpt),
             gemini: keep(ProxyProvider::Gemini, &last.gemini),
         }
     }
@@ -377,6 +476,7 @@ impl ProxyConfig {
 pub struct Upstreams {
     pub anthropic: String,
     pub openai: String,
+    pub chatgpt: String,
     pub gemini: String,
 }
 
@@ -384,6 +484,7 @@ pub struct Upstreams {
 pub enum ProxyProvider {
     Anthropic,
     OpenAi,
+    ChatGpt,
     Gemini,
 }
 
@@ -410,6 +511,7 @@ pub fn env_upstream_override(provider: ProxyProvider) -> Option<String> {
     let var = match provider {
         ProxyProvider::Anthropic => "LEAN_CTX_ANTHROPIC_UPSTREAM",
         ProxyProvider::OpenAi => "LEAN_CTX_OPENAI_UPSTREAM",
+        ProxyProvider::ChatGpt => "LEAN_CTX_CHATGPT_UPSTREAM",
         ProxyProvider::Gemini => "LEAN_CTX_GEMINI_UPSTREAM",
     };
     std::env::var(var).ok().and_then(|v| normalize_url_opt(&v))
@@ -453,6 +555,7 @@ pub fn normalize_url_opt(value: &str) -> Option<String> {
 const ALLOWED_UPSTREAM_HOSTS: &[&str] = &[
     "api.anthropic.com",
     "api.openai.com",
+    "chatgpt.com",
     "generativelanguage.googleapis.com",
 ];
 
@@ -641,6 +744,86 @@ mod tests {
     }
 
     #[test]
+    fn prose_ranker_defaults_to_auto_and_config_sets_it() {
+        // #895: premium extractive path is the default; `truncate`/`off` selects
+        // the legacy squeeze; a typo can never silently disable the premium path.
+        let _lock = crate::core::data_dir::test_env_lock();
+        crate::test_env::remove_var("LEAN_CTX_PROXY_PROSE_RANKER");
+        assert_eq!(
+            ProxyConfig::default().resolved_prose_ranker(),
+            ProseRanker::Auto
+        );
+        let truncate = ProxyConfig {
+            prose_ranker: Some("truncate".into()),
+            ..Default::default()
+        };
+        assert_eq!(truncate.resolved_prose_ranker(), ProseRanker::Truncate);
+        let off = ProxyConfig {
+            prose_ranker: Some("off".into()),
+            ..Default::default()
+        };
+        assert_eq!(off.resolved_prose_ranker(), ProseRanker::Truncate);
+        let extractive = ProxyConfig {
+            prose_ranker: Some("extractive".into()),
+            ..Default::default()
+        };
+        assert_eq!(extractive.resolved_prose_ranker(), ProseRanker::Extractive);
+        let typo = ProxyConfig {
+            prose_ranker: Some("extractiveish".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            typo.resolved_prose_ranker(),
+            ProseRanker::Auto,
+            "unknown value must resolve to Auto, never silently off"
+        );
+    }
+
+    #[test]
+    fn output_holdout_defaults_off_and_clamps() {
+        let _lock = crate::core::data_dir::test_env_lock();
+        crate::test_env::remove_var("LEAN_CTX_PROXY_OUTPUT_HOLDOUT");
+        assert_eq!(ProxyConfig::default().output_holdout_fraction(), 0.0);
+        let cfg = ProxyConfig {
+            output_holdout: Some(0.2),
+            ..Default::default()
+        };
+        assert!((cfg.output_holdout_fraction() - 0.2).abs() < f64::EPSILON);
+        let over = ProxyConfig {
+            output_holdout: Some(5.0),
+            ..Default::default()
+        };
+        assert_eq!(over.output_holdout_fraction(), 1.0, "clamped into [0,1]");
+    }
+
+    #[test]
+    fn verbosity_steer_defaults_off_and_env_overrides() {
+        let _lock = crate::core::data_dir::test_env_lock();
+        crate::test_env::remove_var("LEAN_CTX_PROXY_VERBOSITY_STEER");
+        assert!(!ProxyConfig::default().verbosity_steer_enabled());
+        let cfg = ProxyConfig {
+            verbosity_steer: Some(true),
+            ..Default::default()
+        };
+        assert!(cfg.verbosity_steer_enabled());
+        crate::test_env::set_var("LEAN_CTX_PROXY_VERBOSITY_STEER", "on");
+        assert!(ProxyConfig::default().verbosity_steer_enabled());
+        crate::test_env::remove_var("LEAN_CTX_PROXY_VERBOSITY_STEER");
+    }
+
+    #[test]
+    fn prose_ranker_env_overrides_config() {
+        let _lock = crate::core::data_dir::test_env_lock();
+        let cfg = ProxyConfig {
+            prose_ranker: Some("auto".into()),
+            ..Default::default()
+        };
+        crate::test_env::set_var("LEAN_CTX_PROXY_PROSE_RANKER", "truncate");
+        assert_eq!(cfg.resolved_prose_ranker(), ProseRanker::Truncate);
+        crate::test_env::remove_var("LEAN_CTX_PROXY_PROSE_RANKER");
+    }
+
+    #[test]
     fn config_flag_enables_insecure_http_optin() {
         // `Some(true)` resolves to `true` regardless of the environment, so this
         // assertion is robust without mutating process-global env vars.
@@ -663,6 +846,7 @@ mod tests {
         let up = cfg.resolve_all_disk();
         assert_eq!(up.openai, "http://127.0.0.1:19101");
         assert_eq!(up.anthropic, "https://api.anthropic.com");
+        assert_eq!(up.chatgpt, "https://chatgpt.com");
         assert_eq!(up.gemini, "https://generativelanguage.googleapis.com");
     }
 
@@ -686,6 +870,7 @@ mod tests {
         let last = Upstreams {
             anthropic: "https://api.anthropic.com".into(),
             openai: "http://127.0.0.1:19101".into(),
+            chatgpt: "https://chatgpt.com".into(),
             gemini: "https://generativelanguage.googleapis.com".into(),
         };
         let cfg = ProxyConfig {
@@ -707,6 +892,7 @@ mod tests {
         let last = Upstreams {
             anthropic: "https://api.anthropic.com".into(),
             openai: "http://127.0.0.1:19101".into(),
+            chatgpt: "https://chatgpt.com".into(),
             gemini: "https://generativelanguage.googleapis.com".into(),
         };
         let cfg = ProxyConfig {

@@ -30,9 +30,9 @@ pub use enums::{
 pub use memory::{MemoryCleanup, MemoryGuardConfig, MemoryProfile, SavingsFooter};
 pub use provenance::{ConfigProvenance, EnvOverride};
 pub use proxy::{
-    HistoryMode, ProseRole, ProxyConfig, ProxyProvider, RoleAggressiveness, UpstreamDrift,
-    Upstreams, diagnose_drift, env_upstream_override, is_local_proxy_url, normalize_url,
-    normalize_url_opt,
+    HistoryMode, ProseRanker, ProseRole, ProxyConfig, ProxyProvider, RoleAggressiveness,
+    UpstreamDrift, Upstreams, diagnose_drift, env_upstream_override, is_local_proxy_url,
+    normalize_url, normalize_url_opt,
 };
 pub use shell_activation::ShellActivation;
 
@@ -712,10 +712,12 @@ fn strip_sensitive_overrides(local: &mut Config) -> Vec<&'static str> {
     }
     if local.proxy.anthropic_upstream.is_some()
         || local.proxy.openai_upstream.is_some()
+        || local.proxy.chatgpt_upstream.is_some()
         || local.proxy.gemini_upstream.is_some()
     {
         local.proxy.anthropic_upstream = None;
         local.proxy.openai_upstream = None;
+        local.proxy.chatgpt_upstream = None;
         local.proxy.gemini_upstream = None;
         withheld.push("proxy.*_upstream");
     }
@@ -1423,6 +1425,9 @@ impl Config {
         }
         if local.proxy.openai_upstream.is_some() {
             self.proxy.openai_upstream = local.proxy.openai_upstream;
+        }
+        if local.proxy.chatgpt_upstream.is_some() {
+            self.proxy.chatgpt_upstream = local.proxy.chatgpt_upstream;
         }
         if local.proxy.gemini_upstream.is_some() {
             self.proxy.gemini_upstream = local.proxy.gemini_upstream;

@@ -25,6 +25,14 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
         ),
     );
     proxy.insert(
+        "chatgpt_upstream".into(),
+        key(
+            "string?",
+            serde_json::json!(cfg.proxy.chatgpt_upstream),
+            "Custom upstream URL for ChatGPT/Codex subscription API proxy",
+        ),
+    );
+    proxy.insert(
         "gemini_upstream".into(),
         key(
             "string?",
@@ -100,6 +108,33 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             "off",
             "Cache-safe cross-provider reasoning-effort control (#834). off (default) = no-op. minimal|low|medium|high pins the model's reasoning depth across providers: lean-ctx translates it to OpenAI reasoning_effort / reasoning.effort, Anthropic output_config.effort, and Gemini thinkingConfig (thinkingLevel on 3.x, thinkingBudget on 2.5 pro/flash), only on models that accept it and only when the client didn't set its own value. The level is a constant, so it never breaks the provider prompt cache (unlike per-turn effort routing). Anthropic is dialed only when the client already requested adaptive thinking",
             "LEAN_CTX_PROXY_EFFORT",
+        ),
+    );
+    proxy.insert(
+        "prose_ranker".into(),
+        key_enum_with_env(
+            &["auto", "extractive", "truncate"],
+            "auto",
+            "How the proxy squeezes prose it must shrink (#895). auto (default) and extractive use embedding-based extractive ranking — keeping the most central sentences instead of just the prefix — when the local embedding engine is available, else fall back to truncation; truncate keeps the original deterministic FIFO squeeze and never loads the engine. Wire rewrites are memoized per content so the engine's cold→warm transition never changes an already-emitted frozen-region rewrite (cache-safe, #448/#498)",
+            "LEAN_CTX_PROXY_PROSE_RANKER",
+        ),
+    );
+    proxy.insert(
+        "output_holdout".into(),
+        key_with_env(
+            "f64",
+            serde_json::json!(cfg.proxy.output_holdout_fraction()),
+            "Fraction 0.0-1.0 of conversations placed in the output-savings control arm (#895). 0 (default) = no holdout (every conversation is output-shaped). When > 0, a deterministic cohort = blake3(system + first user message) puts ~this fraction in a control arm that skips output-shaping (effort control + verbosity steer) but is still metered, yielding an honest measured output-token reduction (lean-ctx output-savings). The cohort is a pure function of conversation identity, so a conversation keeps one arm across all turns - cache-safe",
+            "LEAN_CTX_PROXY_OUTPUT_HOLDOUT",
+        ),
+    );
+    proxy.insert(
+        "verbosity_steer".into(),
+        key_with_env(
+            "bool",
+            serde_json::json!(cfg.proxy.verbosity_steer_enabled()),
+            "Opt-in cache-safe wire verbosity steer (#895). When true, the proxy appends a single constant 'be concise' instruction to the last user turn of each request - output-shaping for raw API clients that do not load lean-ctx rules. The suffix is constant and appended strictly after the last cache_control breakpoint (a new trailing text block, never modifying a cache-anchored block), so the provider prompt-cache prefix stays byte-stable. Under an output_holdout the control arm skips it so its effect is measured. Default false",
+            "LEAN_CTX_PROXY_VERBOSITY_STEER",
         ),
     );
     sections.insert(

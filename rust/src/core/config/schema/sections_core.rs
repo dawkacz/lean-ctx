@@ -549,6 +549,14 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             ),
         );
     root.insert(
+        "proxy_require_token".into(),
+        key(
+            "bool",
+            serde_json::json!(cfg.proxy_require_token),
+            "Require lean-ctx Bearer token authentication and disable provider API key fallback",
+        ),
+    );
+    root.insert(
         "response_verbosity".into(),
         key_enum_with_env(
             &["normal", "compact", "minimal"],
@@ -946,6 +954,15 @@ pub(super) fn build(sections: &mut BTreeMap<String, SectionSchema>) {
             serde_json::json!(null),
             "Download the embedding model in the background on first semantic need (default: allowed). Set false for air-gapped machines; semantic features then stay off until a model is provided manually.",
             "LEAN_CTX_EMBEDDINGS_AUTO_DOWNLOAD",
+        ),
+    );
+    embedding.insert(
+        "deterministic".into(),
+        key_with_env(
+            "bool",
+            serde_json::json!(null),
+            "Pin embedding inference to a single CPU thread with no GPU provider so vectors are bit-identical across machines (default: off, multi-threaded GPU-capable path). Extractive prose ranking is already deterministic via score quantization; enable this only for cross-machine reproducibility, at a throughput cost.",
+            "LEAN_CTX_EMBEDDING_DETERMINISTIC",
         ),
     );
     sections.insert(
